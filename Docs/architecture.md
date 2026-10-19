@@ -14,7 +14,7 @@ This package implements a lightweight XR provider stack for replaying SensorFlex
   Registers and starts the custom XR subsystems through Unity XR Management.
 
 - `Runtime/Settings.cs`
-  Defines `SensorFlexSettings`, the runtime configuration entry point. It selects the frame source mode, preload count, FPS, optional session alignment, and optional depth settings.
+  Defines `SensorFlexSettings`, the (empty) XR Management configuration object the loader is registered with. Session configuration — frame source mode, archive path, preload count, looping, depth, alignment — lives on `ARSensorFlexSession`.
 
 - `Runtime/ARSensorFlexSession.cs`
   Primary host-app integration component. Attach to `XROrigin` (or any scene object). Drives the replay camera rig by consuming `PoseBridge` pose events and applying position/rotation to the `XROrigin.CameraFloorOffsetObject`. Also applies session alignment transform and clip-plane overrides. Exposes `AutoPlay` — when false, playback starts paused after loading completes. Does **not** handle mesh instantiation — see `ARSensorFlexSceneMesh`.
@@ -26,10 +26,10 @@ This package implements a lightweight XR provider stack for replaying SensorFlex
   Optional UI/scripting bridge that exposes play, pause, step-forward, restart, speed control, and depth visualisation to host applications through `ControlBridge`.
 
 - `Runtime/Subsystem/Camera.cs`
-  Owns playback timing and exposes camera frames to AR Foundation. Calls `SfzSessionStore.StartSession()` on warmup and `SfzSessionStore.Tick()` once per Unity frame, advances the ring-buffer playhead, updates intrinsics and projection matrix from per-frame data, and pushes poses into `PoseBridge`. No direct IO — all session data is read through `SfzSessionStore` proxy properties.
+  Owns playback timing and exposes camera frames to AR Foundation. Calls `SfzSessionStore.StartSession()` on warmup and `SfzSessionStore.Tick()` once per Unity frame, advances the playhead (driven by the color video's frame-ready events), updates intrinsics and projection matrix from per-frame data, and pushes poses into `PoseBridge`. No direct IO — all session data is read through `SfzSessionStore` proxy properties.
 
 - `Runtime/Subsystem/Depth.cs`
-  Exposes environment depth through `XROcclusionSubsystem`. Reads raw depth bytes and ring-buffer state from `SfzSessionStore` each frame. Synchronized to camera frame progression via `OnFramesReady`.
+  Exposes environment depth through `XROcclusionSubsystem`. Serves the RFloat depth texture (metres) that `SfzSessionStore` decodes from `depth.bin` for the current frame. Synchronized to camera frame progression via `OnFramesReady`.
 
 - `Runtime/Subsystem/Session.cs`
   Provides a minimal `XRSessionSubsystem` implementation so the package can participate in the XR lifecycle.
@@ -45,13 +45,15 @@ This package implements a lightweight XR provider stack for replaying SensorFlex
 
 - `Runtime/Library/Store/SfzSessionStore.cs`
   Single source of truth for SFZ/FileIo session lifecycle and data access. `CameraSubsystem` drives it through `StartSession()` / `Tick()` / `StopSessionAsync()`; all other subsystems read state through typed proxy properties. Contains **all** SFZ IO as private nested types — nothing in this file is visible outside it:
-  - `SfzSessionJson` / DTOs — session.json deserialization types
-  - `IBackendState` / `BackendState` — ring-buffer state contract and implementation
+  - `SfzSessionJson` / DTOs — session.json and frames.jsonl deserialization types (SFZ 2.x, see `SensorFlexFormat.md`)
+  - `IBackendState` — playback state contract (its slot members serve the disabled live mode)
+  - `VideoV2BackendState` — `rgb.mp4` through a `VideoPlayer`; depth blocks decoded on demand into an RFloat texture
   - `ISessionBackend` — three-phase backend contract (`Open` / `TryGetSessionJson` / `StartLoading`)
   - `SessionLoadState` — lifecycle enum (`Idle` / `Waiting` / `LoadingAttachments` / `Loading` / `Ready`)
   - `SfzTrackInfo`, `SfzAttachmentInfo`, `SfzSessionData` — parsed session data model
-  - `SfzFileBackend` — ZIP archive source; streams frames on a background thread (`SF-SFZ`)
-  - `FileIoBackend` — loose-file source; identical streaming logic (`SF-FileIo`)
+  - `SfzBackendBase` — shared loading: parses `frames.jsonl`, aligns records to video frames via `rgb_frame`, builds the playback state
+  - `SfzFileBackend` — `.sfz` archive source; extracts `rgb.mp4` / `depth.bin` into a per-session cache directory
+  - `FileIoBackend` — unpacked session directory source; uses the files in place
   - `ScannedMeshLoaderImpl` — consumes `scene_mesh` attachment bytes, drives PLY parse, publishes to `ScannedSceneMeshBridge`
   - `ScannedSceneMeshLoadOperation` / `ScannedSceneMeshData` — task-based PLY load operation
   - `PlyMeshReader` — ASCII and binary-little-endian PLY decoder
@@ -68,10 +70,10 @@ This package implements a lightweight XR provider stack for replaying SensorFlex
 5. Each Unity frame, Camera calls `SfzSessionStore.Tick()`:
    - **Waiting** — polls `TryGetSessionJson()` until session metadata arrives; on success, session data is parsed and state advances to **LoadingAttachments**.
    - **LoadingAttachments** — `ScannedMeshLoaderImpl` consumes `scene_mesh` attachment bytes and waits for the async PLY parse to complete. Sessions with no attachments pass through immediately. The loading overlay reads "Loading attachment: scene mesh". Once all attachments are resolved, `StartLoading()` is called on the backend and state advances to **Loading**.
-   - **Loading** — calls `DrainMainThreadWork()` (GPU uploads); transitions to **Ready** once enough frames are buffered (`framesToWait` threshold).
-   - **Ready** — continues draining; `CameraSubsystem` begins advancing the playhead.
-6. The active backend fills the ring buffer with textures, pose matrices, intrinsics, and depth bytes on a background thread.
-7. The camera provider advances the ring-buffer playhead and publishes data through **two parallel paths**:
+   - **Loading** — waits for the color `VideoPlayer` to finish preparing, then transitions to **Ready**.
+   - **Ready** — `CameraSubsystem` starts the video and advances the playhead.
+6. Poses and intrinsics for every frame are read from `frames.jsonl` up front; depth for the current frame is decoded from `depth.bin` when the video presents that frame.
+7. The camera provider publishes data through **two parallel paths**:
 
    **Path 1 — AR Foundation subsystem APIs:**
    - Color textures → `XRCameraSubsystem` → `ARCameraManager` / background rendering
@@ -120,7 +122,7 @@ This package implements a lightweight XR provider stack for replaying SensorFlex
   │          │                                                             │ │
   │          │  ┌──────────────────────────────────────────────────────┐  │ │
   │          │  │  SfzFileBackend / FileIoBackend  (private nested)     │  │ │
-  │          │  │  background thread · ring buffer · GPU upload         │  │ │
+  │          │  │  rgb.mp4 VideoPlayer · depth.bin block decode         │  │ │
   │          │  └──────────────────────────────────────────────────────┘  │ │
   │          │                                                             │ │
   │          │  ┌──────────────────────────────────────────────────────┐  │ │
@@ -186,16 +188,15 @@ There are two outward-facing publication paths:
 ### SFZ (ZIP archive) — `SfzFileBackend`
 
 - Validates the archive path relative to `StreamingAssets`
-- Reads `session/session.json` from the archive on first poll
-- Streams frames on a dedicated background thread (`SF-SFZ`); sleeps when the ring buffer is full
+- Reads `session/session.json` and `session/frames.jsonl` from the archive
+- Extracts `rgb.mp4` and `depth.bin` to `temporaryCachePath/SFVideoCache/<session_id>/` (always fresh); the directory is deleted when the session stops
 - `TryGetAttachmentBytes()` reads the attachment file from the archive using `s_SessionData` (available from parse time, before `StartLoading`)
-- Keeps the archive open across the full loop pass (`BeginLoadPass`/`EndLoadPass`) so the central directory is parsed only once per iteration
 
 ### FileIo (loose files) — `FileIoBackend`
 
 - Validates the session directory path relative to `StreamingAssets`
-- Reads `session.json` from the directory on first poll
-- Identical streaming logic to SFZ via `SfzBackendBase`
+- Reads `session.json` / `frames.jsonl` from the directory; plays `rgb.mp4` and reads `depth.bin` in place (never deleted)
+- Same loading logic as SFZ via `SfzBackendBase`
 - `TryGetAttachmentBytes()` reads the attachment file directly from disk using `s_SessionData`
 
 ## Session State Machine
@@ -205,22 +206,23 @@ There are two outward-facing publication paths:
 ```
   Idle ──► Waiting ──► LoadingAttachments ──► Loading ──► Ready
               │                │                  │
-      TryGetSessionJson    ScannedMesh-       DrainMain-
-      polls each frame     LoaderImpl         ThreadWork
-                           Tick() each        each frame
+      TryGetSessionJson    ScannedMesh-       VideoPlayer
+      polls each frame     LoaderImpl         prepares
+                           Tick() each
                            frame
 ```
 
-- **Waiting** — `TryGetSessionJson()` is polled each frame; on success, session metadata is parsed and state advances to **LoadingAttachments**.
+- **Waiting** — `TryGetSessionJson()` is polled each frame; on success, session metadata is parsed and state advances to **LoadingAttachments**. A `session.json` that cannot be used (e.g. a retired 1.x archive) logs one error and returns the store to **Idle**.
 - **LoadingAttachments** — `ScannedMeshLoaderImpl.Tick()` runs each frame. It consumes the `scene_mesh` attachment bytes from the backend and waits for the async PLY parse to finish. `IsComplete` is `true` immediately when no `scene_mesh` attachment exists. Once complete, `StartLoading()` is called on the backend and state advances to **Loading**.
-- **Loading** — GPU uploads drain each frame via `DrainMainThreadWork()`; transitions to **Ready** when `BackendState.IsReady` is true (the `framesToWait` preload threshold is met).
-- **Ready** — continues draining; `CameraSubsystem` advances the playhead each frame.
+- **Loading** — waits for the color `VideoPlayer` to prepare; transitions to **Ready** when the playback state reports `IsReady`.
+- **Ready** — `CameraSubsystem` advances the playhead as video frames are presented.
 
 ## Runtime Threading Model
 
 - Unity-facing subsystem methods run on the main thread.
-- SFZ and FileIo frame reads happen on dedicated background threads (`SF-SFZ`, `SF-FileIo`).
-- Texture creation and GPU upload (`LoadImage` / `Apply`) happen on the main thread via `DrainMainThreadWork()`, batched at 3 uploads per frame.
+- Color decoding is done by Unity's `VideoPlayer`; its `frameReady` event drives the playhead.
+- Depth blocks are read and decoded (LZ4 / Zstd) on the main thread for the current frame only — one small block per frame.
+  Rows are flipped on upload: SFZ stores the top row first, Unity textures expect the bottom row first.
 - PLY mesh parsing runs on a background `Task` thread; the `Mesh` object is built on the main thread by `TryComplete()`.
 
 ## Current Design Constraints
@@ -228,4 +230,5 @@ There are two outward-facing publication paths:
 - `PoseBridge` and `ScannedSceneMeshBridge` are package-global static APIs; they are not session-isolated.
 - `SfzSessionStore` is also a static (package-global) store. A future `LiveSessionStore` will implement the same public surface for live WebSocket streaming.
 - New data types beyond color/depth/pose/intrinsics should be modelled as `SfzTrackInfo` entries or `SfzAttachmentInfo` entries in `SfzSessionData`; `ScannedMeshLoaderImpl` inside `SfzSessionStore` is the extension point for new attachment handlers — add a new branch in its `Tick()`.
-- The private nested `SfzSessionJson` class is the authoritative definition of what `session.json` may contain.
+- `Docs/SensorFlexFormat.md` is the authoritative definition of the SFZ format; the private nested `SfzSessionJson` class mirrors the parts the player reads.
+- Depth video encodings (`depth.mp4`) are not played: `VideoPlayer` renders to 8-bit textures, which cannot carry float16 depth. Sessions using them replay without depth (a warning is logged).

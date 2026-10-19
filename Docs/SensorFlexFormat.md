@@ -1,390 +1,227 @@
-# SensorFlex Session Format
+# SensorFlex Session Format (SFZ)
 
-Version 1.0. Self-contained `.sfz` archive (ZIP-compatible) encoding an AR session for
-recording and replay via ARFoundation.
+Version **2.0**. A self-contained `.sfz` archive (ZIP) holding one AR session — color video,
+depth, camera poses and intrinsics, and optionally IMU samples and static attachments — for
+replay through AR Foundation and for offline processing.
+
+Produced by:
+
+| Producer | Color | Depth |
+|---|---|---|
+| SensorFlex Recorder, iOS (ARKit) | `rgb.mp4` H.264/HEVC | `lz4_float32` m (default), `zstd_float32`, `hevc_float16`, `h264_uint8_norm` |
+| SensorFlex Recorder, Android (ARCore) | `rgb.mp4` H.264/HEVC | `lz4_uint16` mm (default), `hevc_uint8_norm`, `h264_uint8_norm` |
+| `data_processing/scannetpp_sfz.py` | `rgb.mp4` re-encoded from the dataset JPEGs | `lz4_uint16` mm (dataset native) |
+| `data_processing/hypersim.py` | `rgb.mp4` encoded from the dataset images | `lz4_float32` m |
 
 **Coordinate system invariant:** all poses and vectors are in Unity world space —
-left-handed, +Y up, +Z forward, meters. This is a format-level constant; it is not
-stored per-session.
+left-handed, +Y up, +Z forward, meters. This is a format-level constant; it is not stored
+per session.
+
+Earlier versions (1.0 per-frame JPEG archives, 1.1 iOS HEVC archives) are no longer read or
+written by any SensorFlex tool.
 
 ---
 
 ## Archive Structure
 
-### Single-file
-
 ```
-session/
-├── session.json          ← all metadata and track data arrays
-├── rgb/
-│   ├── 000000.jpg
-│   └── ...
-├── depth/                (present only when depth channel exists)
-│   ├── 000000.bin
-│   └── ...
-└── scene_mesh.ply        (present only when attachments.scene_mesh exists)
+<session_id>.sfz
+└── session/
+    ├── session.json      session metadata (required)
+    ├── frames.jsonl      one line per camera frame (required)
+    ├── rgb.mp4           color video (required when session.json has "rgb")
+    ├── depth.bin         depth blocks (block encodings)      ┐ one of, when
+    ├── depth.mp4         depth video (video encodings)       ┘ session.json has "depth"
+    ├── imu.jsonl         IMU samples (optional)
+    └── scene_mesh.ply    attachments (optional, any name listed in "attachments")
 ```
 
-### Multi-part
+All file references in `session.json` are relative to `session/`. One archive is one
+session; archives are not split into parts.
 
-When an archive exceeds a target size it is split into numbered part files:
+A session may also be stored unpacked as a directory with the same contents (the player's
+FileIo mode reads such a directory directly).
 
-```
-<scene_id>-00000-of-00003.sfz   session.json + first content chunk(s)
-<scene_id>-00001-of-00003.sfz   next content chunk(s)
-<scene_id>-00002-of-00003.sfz   last content chunk(s)
-```
+### Zip entry compression
 
-- The naming suffix is `-DDDDD-of-DDDDD` (zero-padded, five digits each).
-- A reader that receives **any** part can derive all part filenames from the suffix alone.
-- `session.json` is always in part 0. All other parts contain only binary assets.
-- Content is packed greedily in this order: `session.json` → attachment data → frame data.
-  If the first part has remaining capacity after `session.json`, attachment chunks and then
-  frame assets are added until the size limit is reached before a new part is started.
-- A `parts` manifest in `session.json` describes every part's contents (see below).
-- Readers must verify all parts are present before beginning to load.
+| Entry | Method | Reason |
+|---|---|---|
+| `session.json`, `frames.jsonl`, `imu.jsonl` | DEFLATE | text |
+| `rgb.mp4`, `depth.mp4`, `depth.bin` | STORED | already compressed; STORED entries can be read in place |
+| attachments | DEFLATE | e.g. PLY compresses well |
 
-**Compression:**
-- `.jpg` files: `ZIP_STORED` (already compressed)
-- everything else: `ZIP_DEFLATED`
-
-File paths inside `session.json` are relative to `session/`.
+ZIP64 is allowed (and required for archives over 4 GB).
 
 ---
 
 ## session.json
 
-Single file containing all session metadata and track data arrays. Always lives in part 0
-of a multi-part archive.
-
 ```json
 {
-  "version": "1.0",
-  "session_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-  "start_time_utc": "2026-05-25T10:30:00.000Z",
-  "device": {
-    "model": "iPhone 13 Pro",
-    "os": "iOS 16.0",
-    "ar_framework": "ARKit"
-  },
+  "sfz_version": "2.0",
+  "session_id": "24c603a3e98743719e49825dba32cfb2",
+  "start_time_utc": "2026-10-19T15:26:30.000Z",
+  "device": { "model": "Google Pixel 6a", "os": "Android OS 17 / API-37", "ar_framework": "ARCore" },
+  "actual_fps": 30,
+  "frame_count": 352,
+  "rgb":   { "width": 1920, "height": 1080, "encoding": "hevc_mp4", "file": "rgb.mp4" },
+  "depth": { "width": 160, "height": 90, "encoding": "lz4_uint16", "file": "depth.bin",
+             "units": "millimeters", "sensor": "arcore_environment_depth" },
+  "imu":   { "file": "imu.jsonl", "sample_rate_hz": 60 },
   "attachments": {
     "scene_mesh": { "file": "scene_mesh.ply", "format": "ply" }
-  },
-  "parts": [
-    {
-      "file": "<scene_id>-00000-of-00002.sfz",
-      "contents": [
-        { "type": "session" },
-        { "type": "attachment", "attachment_key": "scene_mesh",
-          "chunk_index": 0, "total_chunks": 2 },
-        { "type": "frames", "frame_range": [0, 499] }
-      ]
-    },
-    {
-      "file": "<scene_id>-00001-of-00002.sfz",
-      "contents": [
-        { "type": "attachment", "attachment_key": "scene_mesh",
-          "chunk_index": 1, "total_chunks": 2 },
-        { "type": "frames", "frame_range": [499, 1250] }
-      ]
-    }
-  ],
-  "tracks": {
-    "frames": {
-      "metadata": {
-        "fps": 60,
-        "channels": {
-          "rgb":   { "width": 1920, "height": 1440, "format": "jpeg" },
-          "depth": { "width": 256, "height": 192, "format": "raw_float32_le",
-                     "units": "meters", "sensor": "lidar", "invalid_value": 0.0 }
-        }
-      },
-      "data": [
-        {
-          "timestamp_ns": 178454292513458,
-          "camera": {
-            "pose": {
-              "position": [1.6947, 4.4221, -1.6195],
-              "rotation": [0.12, 0.34, 0.56, 0.75]
-            },
-            "intrinsics": { "fx": 1425.3125, "fy": 1425.3125, "cx": 954.9786, "cy": 725.3613 }
-          },
-          "light_estimation": { "ambient_intensity": 1000.0, "color_temperature": 6500.0 },
-          "rgb":   { "file": "rgb/000000.jpg" },
-          "depth": { "file": "depth/000000.bin" }
-        },
-        {
-          "timestamp_ns": 178454309180125,
-          "camera": { "..." : "..." },
-          "rgb": { "file": "rgb/000001.jpg" },
-          "depth": { "file": "depth/000001.bin" }
-        }
-      ]
-    },
-    "imu": {
-      "metadata": {
-        "sample_rate_hz": 100
-      },
-      "data": [
-        {
-          "timestamp_ns": 178454275000000,
-          "acceleration":  [0.01, -9.79,  0.03],
-          "rotation_rate": [-0.04, 0.03, -0.05],
-          "gravity":       [-0.97, 0.01, -0.26]
-        },
-        {
-          "timestamp_ns": 178454285000000,
-          "acceleration":  [0.02, -9.80,  0.01],
-          "rotation_rate": [-0.03, 0.02, -0.04],
-          "gravity":       [-0.97, 0.01, -0.26]
-        }
-      ]
-    }
   }
 }
 ```
 
----
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `sfz_version` | string | yes | `"2.0"`. Readers should accept any `"2.x"`. |
+| `session_id` | string | yes | Unique id; also the archive file name by convention. |
+| `start_time_utc` | string | no | ISO-8601 UTC. Empty for converted datasets without a capture time. |
+| `device` | object | yes | `model`, `os`, `ar_framework` (`"ARKit"`, `"ARCore"`, `"ScanNet++"`, `"Hypersim"`, …). |
+| `actual_fps` | int | yes | Measured average camera frame rate. |
+| `frame_count` | int | yes | Number of lines in `frames.jsonl`. |
+| `rgb` | object | no | Color stream; omitted when color was not captured. |
+| `depth` | object | no | Depth stream; omitted when depth was not captured. |
+| `imu` | object | no | IMU stream. |
+| `attachments` | object | no | Static assets keyed by name. |
 
-## Track: frames
+New optional fields may be added within 2.x; readers must ignore fields they do not know.
 
-Camera-rate data aligned to the ARFoundation rendering loop.
-
-### tracks.frames fields
+### rgb
 
 | Field | Description |
 |---|---|
-| `metadata.fps` | Nominal capture rate |
-| `metadata.channels` | Descriptor for each binary channel present (see below) |
-| `data` | Ordered array of frame records, one per camera frame |
+| `width`, `height` | Video frame size in pixels. Intrinsics are expressed at this resolution. |
+| `encoding` | `"hevc_mp4"` or `"h264_mp4"`. Always 8-bit 4:2:0 (players/hardware decoders cannot be assumed to handle 4:4:4). |
+| `file` | `"rgb.mp4"` |
 
-`metadata.channels` contains an entry for each optional per-frame binary channel. `rgb`
-is always present. `depth` and any future binary channels are optional.
-`light_estimation` is inline in each data record and does not appear in `channels`.
+Video frames are matched to frame records through `rgb_frame` (see frames.jsonl), not by
+timestamp. Container timestamps are informational.
 
-### Frame record fields
+### depth
 
-| Field | Type | ARFoundation source | Description |
+| Field | Description |
+|---|---|
+| `width`, `height` | Depth image size in pixels. |
+| `encoding` | See table below. |
+| `file` | `"depth.bin"` (block encodings) or `"depth.mp4"` (video encodings). |
+| `units` | Unit of a decoded value: `"meters"` or `"millimeters"`. |
+| `sensor` | Free-form source label: `"arkit_lidar"`, `"arcore_environment_depth"`, `"scannetpp_lidar"`, `"hypersim_render"`, … |
+| `depth_max_meters` | Only for `*_uint8_norm`: the depth that maps to 255. |
+
+| `encoding` | File | Per-frame data | Decoded value |
 |---|---|---|---|
-| `timestamp_ns` | int64 | `ARCameraFrame.timestampNs` | Nanoseconds since device boot |
-| `camera.pose.position` | float32[3] | `ARCamera.transform.position` | Camera position in Unity world space, meters |
-| `camera.pose.rotation` | float32[4] | `ARCamera.transform.rotation` | Quaternion [x, y, z, w] in Unity world space |
-| `camera.intrinsics.fx` / `fy` | float32 | `XRCameraIntrinsics.focalLength` | Focal lengths in pixels |
-| `camera.intrinsics.cx` / `cy` | float32 | `XRCameraIntrinsics.principalPoint` | Principal point in pixels |
-| `light_estimation.ambient_intensity` | float32 | `ARLightEstimationData.averageIntensityInLumens` | Lumens; omitted if unavailable |
-| `light_estimation.color_temperature` | float32 | `ARLightEstimationData.averageColorTemperature` | Kelvin; omitted if unavailable |
-| `rgb` | file ref | `XRCameraImage` | `{ "file": "rgb/<NNNNNN>.jpg" }` |
-| `depth` | file ref | `XRCpuImage` (occlusion) | `{ "file": "depth/<NNNNNN>.bin" }`; absent if depth channel not present |
+| `lz4_float32` | `depth.bin` | one LZ4 raw block (no frame header) of `width×height` float32 LE | value in `units` |
+| `lz4_uint16` | `depth.bin` | one LZ4 raw block of `width×height` uint16 LE | value in `units` (normally mm) |
+| `zstd_float32` | `depth.bin` | one Zstandard frame of `width×height` float32 LE | value in `units` |
+| `hevc_float16` | `depth.mp4` | one video frame, single 16-bit channel holding IEEE float16 | metres |
+| `hevc_uint8_norm` / `h264_uint8_norm` | `depth.mp4` | one video frame; luma = depth / `depth_max_meters` × 255 | metres (lossy, coarse) |
 
-**`timestamp_ns`:** nanoseconds since device boot, matching `ARCameraFrame.timestampNs`.
-Relative playback time: `(timestamp_ns[i] - timestamp_ns[0]) / 1e9` seconds.
+Depth images are row-major, first row = top of the image, same orientation as the color
+frames. A value of `0` means no depth.
 
-### rgb files
+LZ4 blocks must follow the standard LZ4 block format, including its end-of-block rules
+(the last 5 bytes are literals), so that reference decoders such as `LZ4_decompress_safe` /
+Python `lz4.block.decompress` accept them.
 
-- **Format:** JPEG, sRGB
-- **Resolution:** `channels.rgb.width` × `channels.rgb.height`
-- **Naming:** zero-padded 6-digit frame index — `rgb/000000.jpg`
+### imu
 
-### depth files
+| Field | Description |
+|---|---|
+| `file` | `"imu.jsonl"` |
+| `sample_rate_hz` | Nominal rate. Use per-sample `ts` for actual timing. |
 
-- **Format:** Raw binary, no header; IEEE 754 float32, little-endian, row-major
-- **Size:** `depth_width × depth_height × 4` bytes (fixed)
-- **Invalid:** `0.0` — no depth return
-- **Naming:** zero-padded 6-digit frame index — `depth/000000.bin`
+### attachments
 
-**Depth intrinsics** are not stored separately. Derive from `camera.intrinsics` in the
-frame record and the depth resolution in `metadata.channels.depth`:
+Static assets that are not time series. Each entry: `{"file": "<name>", "format": "<hint>"}`.
 
-```
-fx_d = camera.intrinsics.fx * (depth_width  / rgb_width)
-fy_d = camera.intrinsics.fy * (depth_height / rgb_height)
-cx_d = camera.intrinsics.cx * (depth_width  / rgb_width)
-cy_d = camera.intrinsics.cy * (depth_height / rgb_height)
-```
+| Key | Format | Description |
+|---|---|---|
+| `scene_mesh` | `"ply"` | Reconstructed static mesh of the environment, in the same Unity world frame as the camera poses. PLY ASCII or binary little-endian; `x y z` required, `nx ny nz` and `red green blue` optional. |
 
 ---
 
-## Track: imu
+## frames.jsonl
 
-Higher-frequency sensor data from the Unity Input System, independent of frame timing.
-Typical rate: ~100 Hz. Present only when `"imu"` key exists in `tracks`.
-
-`sample_rate_hz` is nominal — use per-sample `timestamp_ns` for actual timing.
-
-### IMU sample fields
-
-| Field | Type | Unity Input System source | Description |
-|---|---|---|---|
-| `timestamp_ns` | int64 | `InputDevice.lastUpdateTime` (converted) | Nanoseconds since device boot |
-| `acceleration` | float32[3] | `Accelerometer.current.value` | Raw acceleration including gravity, m/s² |
-| `rotation_rate` | float32[3] | `Gyroscope.current.value` | Angular velocity, rad/s |
-| `gravity` | float32[3] | `GravitySensor.current.value` | Gravity direction, unit vector |
-
----
-
-## Attachments
-
-Static assets that accompany the session but are not time-series data. `attachments` is an
-optional top-level object; omit it entirely when no static assets are present.
-
-All file references in `attachments` are relative to `session/`, the same root as track file
-references. Static asset files sit flat in the session root — no subdirectory is used for
-single files.
-
-### attachments.scene_mesh
-
-An offline-reconstructed static mesh of the captured environment.
+One compact JSON object per line, one line per camera frame, in capture order.
 
 ```json
-"attachments": {
-  "scene_mesh": {
-    "file": "scene_mesh.ply",
-    "format": "ply"
-  }
-}
+{"frame":0,"ts":165324298769666,"pos":[-5.06,3.66,1.95],"rot":[-0.0295,-0.71,0.0687,-0.70],"fx":1521.3,"fy":1511.9,"cx":959.8,"cy":543.8,"rgb_frame":0,"depth_off":0,"depth_sz":22531}
 ```
 
 | Field | Type | Description |
 |---|---|---|
-| `file` | string | Path relative to `session/`. Conventionally `scene_mesh.ply`. |
-| `format` | string | Format hint. Currently only `"ply"` is supported. |
+| `frame` | int | Record index, 0-based, contiguous. |
+| `ts` | int64 | Capture timestamp, nanoseconds (device clock; only differences are meaningful). |
+| `pos` | float[3] | Camera position, Unity world space, metres. |
+| `rot` | float[4] | Camera rotation quaternion `[x, y, z, w]`, Unity world space. Camera looks along local +Z, local +Y is up. |
+| `fx`, `fy`, `cx`, `cy` | float | Pinhole intrinsics in pixels at the `rgb` resolution. Omitted when unknown. |
+| `rgb_frame` | int | Index of this record's frame in `rgb.mp4`, or `-1` if its color frame was dropped. Non-negative values are 0, 1, 2, … in record order. |
+| `depth_off`, `depth_sz` | int64, int | Block encodings: byte range of this record's block in `depth.bin`. `depth_sz` = 0 means no depth for this record. |
+| `depth_frame` | int | Video encodings: index of this record's frame in `depth.mp4`. |
 
-**Format:** PLY (ASCII or binary-little-endian). Standard vertex attributes: `x y z` (required);
-`nx ny nz` normals and `red green blue` per-vertex colors (optional).
-
-**Coordinate frame:** Unity world space — the same frame as `tracks.frames` poses.
-No conversion is required when rendering the mesh against replayed camera data.
+Readers map video frame *N* to the record whose `rgb_frame == N`; they must not assume
+video frame *N* is record *N*.
 
 ---
 
-## Multi-Part Archives
+## imu.jsonl
 
-### parts manifest
-
-`session.json` includes a top-level `parts` array when the archive is split. It is omitted
-entirely in single-file archives. Each element describes one part file and its contents.
+One sample per line, in time order. Body-frame vectors use the Unity convention
+(left-handed; device +Z forward).
 
 ```json
-"parts": [
-  {
-    "file": "<scene_id>-00000-of-00003.sfz",
-    "contents": [
-      { "type": "session" },
-      { "type": "attachment", "attachment_key": "scene_mesh",
-        "chunk_index": 0, "total_chunks": 2 },
-      { "type": "frames", "frame_range": [0, 499] }
-    ]
-  },
-  {
-    "file": "<scene_id>-00001-of-00003.sfz",
-    "contents": [
-      { "type": "attachment", "attachment_key": "scene_mesh",
-        "chunk_index": 1, "total_chunks": 2 },
-      { "type": "frames", "frame_range": [499, 999] }
-    ]
-  },
-  {
-    "file": "<scene_id>-00002-of-00003.sfz",
-    "contents": [
-      { "type": "frames", "frame_range": [999, 1250] }
-    ]
-  }
-]
+{"ts":165324298769666,"accel":[0.12,-9.79,0.31],"gyro":[0.001,-0.02,0.004],"gravity":[0.01,-0.999,0.03]}
 ```
 
-### Content item fields
-
-| `type` | Additional fields | Description |
+| Field | Type | Description |
 |---|---|---|
-| `"session"` | — | This part file contains `session/session.json` |
-| `"frames"` | `frame_range: [start, end)` | Frame assets `rgb/NNNNNN.jpg` and `depth/NNNNNN.bin` for indices `[start, end)` |
-| `"attachment"` | `attachment_key`, `chunk_index`, `total_chunks` | Raw byte slice of the named attachment file; concatenate all chunks in `chunk_index` order to recover the original file |
-
-`frame_range` end is **exclusive** (Python-slice convention).
-
-### Reader algorithm
-
-1. Detect the `-DDDDD-of-DDDDD.sfz` suffix in the given filename.
-2. Derive all `total` part paths; verify every file exists before proceeding.
-3. Open part 0, read `session.json`.
-4. If `parts` is present, build two indices from it:
-   - **Frame index → part**: for each `"frames"` item, map `[start, end)` to a part file.
-   - **Attachment chunks → part**: for each `"attachment"` item, record `(chunk_index, part_file)`.
-5. To read `rgb/000500.jpg` or `depth/000500.bin`: parse the frame index (500), look up
-   the interval, open the correct part.
-6. To read an attachment: collect all chunks sorted by `chunk_index`, read each chunk's
-   `session/<attachment.file>` entry from its part, concatenate the raw bytes.
-
-### Size estimation (writer side)
-
-The reference converter (`scannetpp_sfz.py`) estimates per-frame size as:
-
-```
-frame_size ≈ on_disk_rgb_bytes + DEPTH_H × DEPTH_W × 4   (uncompressed depth upper bound)
-```
-
-This is conservative — actual part files are typically smaller than the configured limit
-because depth compresses well under `ZIP_DEFLATED`.
+| `ts` | int64 | Nanoseconds, same clock as `frames.jsonl` `ts`. |
+| `accel` | float[3] | Acceleration including gravity, m/s². |
+| `gyro` | float[3] | Angular velocity, rad/s. |
+| `gravity` | float[3] | Gravity direction, unit vector. Optional. |
 
 ---
 
 ## Coordinate System
 
-All poses and vectors are in **Unity world space: left-handed, +Y up, +Z forward,
-meters.** This is a format-level invariant — not stored in any metadata file.
+All poses and vectors are in **Unity world space: left-handed, +Y up, +Z forward, metres.**
+A decoder assigns `pos` / `rot` directly to `Transform.position` / `Transform.rotation`.
 
-A decoder reads positions and quaternions directly into `Transform.position` and
-`Transform.rotation` without conversion.
+**Converting from ARKit / ScanNet++ (right-handed, +Y up, −Z forward, camera-to-world 4×4):**
 
-**Converting from ARKit (right-handed, +Y up, −Z forward):**
+1. Flip Z: negate the Z row and Z column (`R' = C·R·C`, `C = diag(1, 1, −1, 1)`; m22 is
+   negated twice and stays).
+2. Rotate the camera 180° about its local X (post-multiply by `diag(1, −1, −1)`), so the
+   optical axis is +Z and image-up is +Y as Unity cameras expect.
 
-ARKit provides camera-to-world matrices (row-major 4×4). Flip the Z axis by negating
-the Z row and Z column (the diagonal element m22 double-negates to unchanged):
-
-```csharp
-Matrix4x4 ConvertPose(float[][] m) {
-    var r = ToMatrix4x4(m);
-    r.m02 = -r.m02; r.m12 = -r.m12; r.m22 = -r.m22; r.m32 = -r.m32; // Z column
-    r.m20 = -r.m20; r.m21 = -r.m21; r.m23 = -r.m23;                  // Z row
-    return r;
-}
-
-var pos = new Vector3(converted.m03, converted.m13, converted.m23);
-var rot = converted.rotation;
-```
+Body-frame IMU vectors are Z-flipped the same way. Meshes (e.g. `scene_mesh`) are converted
+by the writer, not the reader: negate Z of every vertex and normal and reverse triangle winding
+(the Z flip mirrors the mesh).
 
 ---
 
-## Decoding (C# / Unity)
+## Decoding examples
 
-```csharp
-// depth file
-float[,] DecodeDepth(byte[] bytes, int w, int h) {
-    var depth = new float[h, w];
-    Buffer.BlockCopy(bytes, 0, depth, 0, bytes.Length);
-    return depth;
-}
+**Python** (`data_processing/sfz_reader.py` implements all of this):
 
-// frame record
-var frame = JsonConvert.DeserializeObject<FrameRecord>(frameJson);
+```python
+import json, zipfile, lz4.block, numpy as np
 
-transform.SetPositionAndRotation(
-    new Vector3(frame.camera.pose.position[0], frame.camera.pose.position[1], frame.camera.pose.position[2]),
-    new Quaternion(frame.camera.pose.rotation[0], frame.camera.pose.rotation[1],
-                   frame.camera.pose.rotation[2], frame.camera.pose.rotation[3])
-);
+z = zipfile.ZipFile("session.sfz")
+meta = json.loads(z.read("session/session.json"))
+frames = [json.loads(l) for l in z.read("session/frames.jsonl").splitlines()]
+d = meta["depth"]; blob = z.read("session/" + d["file"])
+
+f = frames[0]
+dtype = {"lz4_uint16": "<u2", "lz4_float32": "<f4"}[d["encoding"]]
+raw = lz4.block.decompress(blob[f["depth_off"]:f["depth_off"] + f["depth_sz"]],
+                           uncompressed_size=d["width"] * d["height"] * np.dtype(dtype).itemsize)
+depth = np.frombuffer(raw, dtype).reshape(d["height"], d["width"])
+depth_m = depth * (0.001 if d["units"] == "millimeters" else 1.0)
 ```
 
----
-
-## External Dataset Converters
-
-Converters from external datasets produce SensorFlex archives by:
-
-1. Transforming poses into Unity left-handed space.
-2. Writing `session.json` with correct device metadata and all track data.
-3. Including only tracks and channels the source data contains.
-
-| Dataset | Converter |
-|---|---|
-| ScanNet++ (iPhone / ARKit) | `data_processing/scannetpp_sfz.py` |
+**C# / Unity:** see `SfzSessionStore` in `com.sensorflex.player.unity` (video via
+`VideoPlayer`, depth blocks via `Lz4BlockDecoder` into an `RFloat` texture in metres).
