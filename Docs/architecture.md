@@ -47,12 +47,12 @@ This package implements a lightweight XR provider stack for replaying SensorFlex
   Single source of truth for SFZ/FileIo session lifecycle and data access. `CameraSubsystem` drives it through `StartSession()` / `Tick()` / `StopSessionAsync()`; all other subsystems read state through typed proxy properties. Contains **all** SFZ IO as private nested types — nothing in this file is visible outside it:
   - `SfzSessionJson` / DTOs — session.json and frames.jsonl deserialization types (SFZ 2.x, see `SensorFlexFormat.md`)
   - `IBackendState` — playback state contract (its slot members serve the disabled live mode)
-  - `VideoV2BackendState` — `rgb.mp4` through a `VideoPlayer`; depth blocks decoded on demand into an RFloat texture
+  - `VideoV2BackendState` — the color sensor's video through a `VideoPlayer`; depth blocks decoded on demand into an RFloat texture
   - `ISessionBackend` — three-phase backend contract (`Open` / `TryGetSessionJson` / `StartLoading`)
   - `SessionLoadState` — lifecycle enum (`Idle` / `Waiting` / `LoadingAttachments` / `Loading` / `Ready`)
   - `SfzTrackInfo`, `SfzAttachmentInfo`, `SfzSessionData` — parsed session data model
-  - `SfzBackendBase` — shared loading: parses `frames.jsonl`, aligns records to video frames via `rgb_frame`, builds the playback state
-  - `SfzFileBackend` — `.sfz` archive source; extracts `rgb.mp4` / `depth.bin` into a per-session cache directory
+  - `SfzBackendBase` — shared loading: picks the color sensor (`frame_source`) and a depth sensor from `sensors`, reads their blocks from `frames.jsonl`, aligns frames to video frames via the color `index`, builds the playback state
+  - `SfzFileBackend` — `.sfz` archive source; extracts the color video and depth file into a per-session cache directory
   - `FileIoBackend` — unpacked session directory source; uses the files in place
   - `ScannedMeshLoaderImpl` — consumes `scene_mesh` attachment bytes, drives PLY parse, publishes to `ScannedSceneMeshBridge`
   - `ScannedSceneMeshLoadOperation` / `ScannedSceneMeshData` — task-based PLY load operation
@@ -122,7 +122,7 @@ This package implements a lightweight XR provider stack for replaying SensorFlex
   │          │                                                             │ │
   │          │  ┌──────────────────────────────────────────────────────┐  │ │
   │          │  │  SfzFileBackend / FileIoBackend  (private nested)     │  │ │
-  │          │  │  rgb.mp4 VideoPlayer · depth.bin block decode         │  │ │
+  │          │  │  color video VideoPlayer · depth block decode         │  │ │
   │          │  └──────────────────────────────────────────────────────┘  │ │
   │          │                                                             │ │
   │          │  ┌──────────────────────────────────────────────────────┐  │ │
@@ -189,13 +189,13 @@ There are two outward-facing publication paths:
 
 - Validates the archive path relative to `StreamingAssets`
 - Reads `session/session.json` and `session/frames.jsonl` from the archive
-- Extracts `rgb.mp4` and `depth.bin` to `temporaryCachePath/SFVideoCache/<session_id>/` (always fresh); the directory is deleted when the session stops
+- Extracts the color video and depth file to `temporaryCachePath/SFVideoCache/<session_id>/` (always fresh); the directory is deleted when the session stops
 - `TryGetAttachmentBytes()` reads the attachment file from the archive using `s_SessionData` (available from parse time, before `StartLoading`)
 
 ### FileIo (loose files) — `FileIoBackend`
 
 - Validates the session directory path relative to `StreamingAssets`
-- Reads `session.json` / `frames.jsonl` from the directory; plays `rgb.mp4` and reads `depth.bin` in place (never deleted)
+- Reads `session.json` / `frames.jsonl` from the directory; plays the color video and reads the depth file in place (never deleted)
 - Same loading logic as SFZ via `SfzBackendBase`
 - `TryGetAttachmentBytes()` reads the attachment file directly from disk using `s_SessionData`
 
@@ -231,4 +231,5 @@ There are two outward-facing publication paths:
 - `SfzSessionStore` is also a static (package-global) store. A future `LiveSessionStore` will implement the same public surface for live WebSocket streaming.
 - New data types beyond color/depth/pose/intrinsics should be modelled as `SfzTrackInfo` entries or `SfzAttachmentInfo` entries in `SfzSessionData`; `ScannedMeshLoaderImpl` inside `SfzSessionStore` is the extension point for new attachment handlers — add a new branch in its `Tick()`.
 - `Docs/SensorFlexFormat.md` is the authoritative definition of the SFZ format; the private nested `SfzSessionJson` class mirrors the parts the player reads.
+- One color sensor and one depth sensor are replayed (the `frame_source` color sensor; the depth sensor named `depth`, else the first). Depth is shown through AR Foundation occlusion, which assumes it is aligned with the camera image — true for handheld rigs. Depth sensors with their own viewpoint (e.g. headset eye views) would need reprojection, which is not implemented.
 - Depth video encodings (`depth.mp4`) are not played: `VideoPlayer` renders to 8-bit textures, which cannot carry float16 depth. Sessions using them replay without depth (a warning is logged).

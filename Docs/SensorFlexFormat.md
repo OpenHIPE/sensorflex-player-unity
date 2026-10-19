@@ -94,7 +94,9 @@ Sensor names are free-form; readers find sensors by `type`, not by name.
 
 ### Sensor types
 
-Every sensor has `type` and `file`. Further fields depend on the type.
+Every sensor has `type` and `file`. Further fields depend on the type. A sensor whose data
+was not captured at all (e.g. a pose-only recording) has no `file`; its blocks still carry
+`ts`, pose and intrinsics, with `index` = -1.
 
 **`color`** — a camera producing images.
 

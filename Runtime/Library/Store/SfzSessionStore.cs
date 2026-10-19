@@ -16,7 +16,7 @@
 //   SfzSessionData                — parsed session.json aggregate
 //   SfzSessionJson / DTOs         — session.json and frames.jsonl deserialization types
 //   ReadZipEntry                  — drains a ZipArchiveEntry into byte[]
-//   SfzBackendBase                — shared loading: frames.jsonl parse, rgb_frame alignment, playback state
+//   SfzBackendBase                — shared loading: frames.jsonl parse, color-index alignment, playback state
 //   SfzFileBackend                — SFZ (ZIP archive) source; extracts large files per session
 //   FileIoBackend                 — FileIo (directory) source; uses files in place
 //   ScannedMeshLoaderImpl         — polls for scene_mesh attachment, drives PLY parse
@@ -205,7 +205,7 @@ namespace SensorFlex.Player.Library
             _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, null)
         };
 
-        // Parses session.json (SFZ 2.x — see Docs/SensorFlexFormat.md).
+        // Parses session.json (SFZ 2.x sensor rig — see Docs/SensorFlexFormat.md).
         static bool TryParseSession(string json, out SfzSessionData data)
         {
             data = null;
@@ -222,6 +222,47 @@ namespace SensorFlex.Player.Library
             }
             if (string.IsNullOrEmpty(raw.session_id)) return false;
 
+            // Sensors are keyed by free-form names; JsonUtility cannot read dictionaries.
+            var sensors = new Dictionary<string, SfzSensorJson>();
+            if (Json.TryGetMembers(json, out var top) && top.TryGetValue("sensors", out var sensorsJson) &&
+                Json.TryGetMembers(sensorsJson, out var sensorMembers))
+            {
+                foreach (var kv in sensorMembers)
+                {
+                    var sensor = JsonUtility.FromJson<SfzSensorJson>(kv.Value);
+                    if (sensor != null) sensors[kv.Key] = sensor;
+                }
+            }
+
+            // Color: the frame source when it is a color sensor with video, else the first one.
+            string colorName = null;
+            if (!string.IsNullOrEmpty(raw.frame_source) && sensors.TryGetValue(raw.frame_source, out var fs) &&
+                fs.type == "color" && !string.IsNullOrEmpty(fs.file))
+                colorName = raw.frame_source;
+            foreach (var kv in sensors)
+                if (colorName == null && kv.Value.type == "color" && !string.IsNullOrEmpty(kv.Value.file))
+                    colorName = kv.Key;
+            if (colorName == null)
+            {
+                Debug.LogError("[SF] SFZ: session has no color sensor with video — nothing to replay.");
+                return false;
+            }
+            if (colorName != raw.frame_source)
+                Debug.LogWarning($"[SF] SFZ: frame_source '{raw.frame_source}' is not a color video; replaying '{colorName}'.");
+
+            // Depth: the sensor named "depth" if present, else the first depth sensor.
+            string depthName = sensors.TryGetValue("depth", out var dn) && dn.type == "depth" ? "depth" : null;
+            foreach (var kv in sensors)
+                if (depthName == null && kv.Value.type == "depth")
+                    depthName = kv.Key;
+            int depthSensorCount = 0;
+            foreach (var kv in sensors) if (kv.Value.type == "depth") depthSensorCount++;
+            if (depthSensorCount > 1)
+                Debug.Log($"[SF] SFZ: {depthSensorCount} depth sensors; replaying '{depthName}'.");
+
+            var color = sensors[colorName];
+            var depth = depthName != null ? sensors[depthName] : null;
+
             double sampleInterval = raw.actual_fps > 0 ? 1.0 / raw.actual_fps : 1.0 / 60;
             var tracks = new Dictionary<string, SfzTrackInfo>
             {
@@ -233,9 +274,9 @@ namespace SensorFlex.Player.Library
                 attachments["scene_mesh"] = new SfzAttachmentInfo(
                     "scene_mesh", raw.attachments.scene_mesh.file, raw.attachments.scene_mesh.format);
 
-            // Depth: block encodings are decoded per frame from depth.bin; video encodings
-            // (depth.mp4) cannot be decoded exactly through VideoPlayer and are not played.
-            string depthEncoding = raw.depth?.encoding;
+            // Depth: block encodings are decoded per frame from the sensor's .bin; video encodings
+            // cannot be decoded exactly through VideoPlayer and are not played.
+            string depthEncoding = depth?.encoding;
             string depthBinFile  = null;
             switch (depthEncoding)
             {
@@ -244,7 +285,7 @@ namespace SensorFlex.Player.Library
                 case "lz4_float32":
                 case "lz4_uint16":
                 case "zstd_float32":
-                    depthBinFile = raw.depth.file ?? "depth.bin";
+                    depthBinFile = depth.file;
                     break;
                 default:
                     Debug.LogWarning($"[SF] SFZ: depth encoding '{depthEncoding}' is not supported by the player — " +
@@ -253,7 +294,7 @@ namespace SensorFlex.Player.Library
             }
 
             // Factor that converts a decoded depth value to metres.
-            float depthUnitScale = raw.depth?.units switch
+            float depthUnitScale = depth?.units switch
             {
                 "millimeters" => 0.001f,
                 "centimeters" => 0.01f,
@@ -264,14 +305,16 @@ namespace SensorFlex.Player.Library
                 raw.session_id,
                 tracks,
                 attachments,
-                rgbMp4File:     raw.rgb?.file ?? "rgb.mp4",
+                colorSensor:    colorName,
+                depthSensor:    depthBinFile != null ? depthName : null,
+                rgbMp4File:     color.file,
                 depthBinFile:   depthBinFile,
                 depthEncoding:  depthEncoding,
                 depthUnitScale: depthUnitScale,
-                rgbWidth:       raw.rgb?.width    ?? 1920,
-                rgbHeight:      raw.rgb?.height   ?? 1440,
-                depthWidth:     raw.depth?.width  ?? 256,
-                depthHeight:    raw.depth?.height ?? 192,
+                rgbWidth:       color.width  > 0 ? color.width  : 1920,
+                rgbHeight:      color.height > 0 ? color.height : 1440,
+                depthWidth:     depth != null && depth.width  > 0 ? depth.width  : 256,
+                depthHeight:    depth != null && depth.height > 0 ? depth.height : 192,
                 frameCount:     raw.frame_count);
 
             return true;
@@ -610,10 +653,8 @@ namespace SensorFlex.Player.Library
             public Vector4    Intrinsics;    // (fx, fy, cx, cy)
             public long       DepthByteOffset;
             public int        DepthByteSize;
-            public int        RgbFrame;      // index into rgb.mp4; -1 = no color; RgbFrameAbsent = field missing
+            public int        ColorIndex;    // frame index in the color video; -1 = no image
         }
-
-        const int RgbFrameAbsent = int.MinValue;
 
         // ── Nested: Session contracts ─────────────────────────────────────────
 
@@ -671,6 +712,8 @@ namespace SensorFlex.Player.Library
             public string SessionId { get; }
             public IReadOnlyDictionary<string, SfzTrackInfo>       Tracks      { get; }
             public IReadOnlyDictionary<string, SfzAttachmentInfo>  Attachments { get; }
+            internal string ColorSensor   { get; }  // sensor names as keyed in session.json / frames.jsonl
+            internal string DepthSensor   { get; }  // null when there is no playable depth
             internal string RgbMp4File    { get; }
             internal string DepthBinFile  { get; }  // null when there is no playable depth
             internal string DepthEncoding { get; }  // "lz4_float32", "lz4_uint16", "zstd_float32"
@@ -685,7 +728,9 @@ namespace SensorFlex.Player.Library
                 string sessionId,
                 IReadOnlyDictionary<string, SfzTrackInfo>      tracks,
                 IReadOnlyDictionary<string, SfzAttachmentInfo> attachments,
-                string rgbMp4File      = "rgb.mp4",
+                string colorSensor     = "color",
+                string depthSensor     = null,
+                string rgbMp4File      = "color.mp4",
                 string depthBinFile    = null,
                 string depthEncoding   = null,
                 float  depthUnitScale  = 1f,
@@ -698,6 +743,8 @@ namespace SensorFlex.Player.Library
                 SessionId      = sessionId   ?? "session";
                 Tracks         = tracks      ?? new Dictionary<string, SfzTrackInfo>();
                 Attachments    = attachments ?? new Dictionary<string, SfzAttachmentInfo>();
+                ColorSensor    = colorSensor;
+                DepthSensor    = depthSensor;
                 RgbMp4File     = rgbMp4File;
                 DepthBinFile   = depthBinFile;
                 DepthEncoding  = depthEncoding;
@@ -713,8 +760,16 @@ namespace SensorFlex.Player.Library
         // ── Nested: session.json / frames.jsonl DTOs (SFZ 2.x) ────────────────
 
         [Serializable] class SfzDeviceJson { public string model; public string os; public string ar_framework; }
-        [Serializable] class SfzRgbJson    { public int width; public int height; public string encoding; public string file; }
-        [Serializable] class SfzDepthJson  { public int width; public int height; public string encoding; public string file; public string units; public string sensor; public float depth_max_meters; }
+        [Serializable] class SfzSensorJson
+        {
+            public string type;        // "color", "depth", "imu"
+            public string file;
+            public string encoding;
+            public int    width, height;
+            public string units;
+            public string source;
+            public float  depth_max_meters;
+        }
         [Serializable] class SfzAttachmentJson  { public string file; public string format; }
         [Serializable] class SfzAttachmentsJson { public SfzAttachmentJson scene_mesh; }
 
@@ -727,21 +782,96 @@ namespace SensorFlex.Player.Library
             public SfzDeviceJson      device;
             public int                actual_fps;
             public int                frame_count;
-            public SfzRgbJson         rgb;
-            public SfzDepthJson       depth;
+            public string             frame_source;
             public SfzAttachmentsJson attachments;
+            // "sensors" is a name-keyed object; read with Json.TryGetMembers.
         }
 
-        [Serializable] class SfzFrameLineJson
+        // One sensor's block within a frames.jsonl line.
+        [Serializable] class SfzSensorBlockJson
         {
-            public int     frame;
             public long    ts;
+            public int     index;
             public float[] pos;
             public float[] rot;
             public float   fx, fy, cx, cy;
-            public long    depth_off;
-            public int     depth_sz;
-            public int     rgb_frame = RgbFrameAbsent;   // absent in archives written before rgb_frame existed
+            public long    off;
+            public int     sz;
+        }
+
+        // Minimal JSON helper: splits an object into its top-level members (name → raw JSON text),
+        // so name-keyed objects (sensors, per-sensor frame blocks) can be read with JsonUtility.
+        static class Json
+        {
+            public static bool TryGetMembers(string json, out Dictionary<string, string> members)
+            {
+                members = new Dictionary<string, string>();
+                int i = SkipWs(json, 0);
+                if (i >= json.Length || json[i] != '{') return false;
+                i = SkipWs(json, i + 1);
+                if (i < json.Length && json[i] == '}') return true;
+
+                while (i < json.Length)
+                {
+                    if (json[i] != '"') return false;
+                    int keyEnd = SkipString(json, i);
+                    if (keyEnd < 0) return false;
+                    string key = json.Substring(i + 1, keyEnd - i - 2);   // names are plain identifiers
+
+                    i = SkipWs(json, keyEnd);
+                    if (i >= json.Length || json[i] != ':') return false;
+                    i = SkipWs(json, i + 1);
+
+                    int valueEnd = SkipValue(json, i);
+                    if (valueEnd < 0) return false;
+                    members[key] = json.Substring(i, valueEnd - i);
+
+                    i = SkipWs(json, valueEnd);
+                    if (i >= json.Length) return false;
+                    if (json[i] == '}') return true;
+                    if (json[i] != ',') return false;
+                    i = SkipWs(json, i + 1);
+                }
+                return false;
+            }
+
+            static int SkipWs(string s, int i)
+            {
+                while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
+                return i;
+            }
+
+            // s[i] is the opening quote; returns the index just past the closing quote.
+            static int SkipString(string s, int i)
+            {
+                for (i++; i < s.Length; i++)
+                {
+                    if (s[i] == '\\') i++;
+                    else if (s[i] == '"') return i + 1;
+                }
+                return -1;
+            }
+
+            // Returns the index just past the value starting at s[i].
+            static int SkipValue(string s, int i)
+            {
+                if (i >= s.Length) return -1;
+                if (s[i] == '"') return SkipString(s, i);
+                if (s[i] != '{' && s[i] != '[')
+                {
+                    while (i < s.Length && s[i] != ',' && s[i] != '}' && s[i] != ']' && !char.IsWhiteSpace(s[i])) i++;
+                    return i;
+                }
+                int depth = 0;
+                for (; i < s.Length; i++)
+                {
+                    char c = s[i];
+                    if (c == '"') { i = SkipString(s, i) - 1; if (i < 0) return -1; }
+                    else if (c == '{' || c == '[') depth++;
+                    else if (c == '}' || c == ']') { if (--depth == 0) return i + 1; }
+                }
+                return -1;
+            }
         }
 
         static byte[] ReadZipEntry(ZipArchiveEntry entry)
@@ -817,8 +947,8 @@ namespace SensorFlex.Player.Library
                     ? GetLocalFilePath(data.DepthBinFile, data.SessionId)
                     : null;
 
-                // Parse frames.jsonl for poses, intrinsics, depth offsets and rgb_frame.
-                var v2Records = ParseFramesJsonl(totalFrames);
+                // Parse frames.jsonl: per-sensor blocks → poses, intrinsics, color index, depth ranges.
+                var v2Records = ParseFramesJsonl(totalFrames, data.ColorSensor, data.DepthSensor);
                 if (v2Records != null && v2Records.Length > 0 && v2Records.Length < totalFrames)
                     totalFrames = v2Records.Length;   // records without a color frame were removed
 
@@ -850,7 +980,7 @@ namespace SensorFlex.Player.Library
                 Debug.Log($"[SF] {BackendLabel}: SFZ 2.x loading started. frames={totalFrames} fps={1.0 / vState.FrameInterval:F0}");
             }
 
-            SfzV2FrameRecord[] ParseFramesJsonl(int expectedCount)
+            SfzV2FrameRecord[] ParseFramesJsonl(int expectedCount, string colorName, string depthName)
             {
                 byte[] bytes = ReadSessionFile("frames.jsonl");
                 if (bytes == null)
@@ -864,25 +994,34 @@ namespace SensorFlex.Player.Library
                     var records = new List<SfzV2FrameRecord>(expectedCount);
                     using var reader = new StreamReader(new MemoryStream(bytes), Encoding.UTF8);
                     string line;
+                    int frame = 0;
                     while ((line = reader.ReadLine()) != null)
                     {
                         if (string.IsNullOrWhiteSpace(line)) continue;
-                        var j = JsonUtility.FromJson<SfzFrameLineJson>(line);
-                        if (j == null) continue;
+                        if (!Json.TryGetMembers(line, out var members)) continue;
+
+                        // Camera pose and intrinsics come from the replayed color sensor's block.
+                        // Depth contributes only its data range: AR Foundation occlusion assumes depth
+                        // aligned with the camera image, which holds for handheld rigs. (Per-sample depth
+                        // pose/intrinsics, e.g. headset eye views, would need reprojection — not done.)
+                        var c = members.TryGetValue(colorName, out var cj) ? JsonUtility.FromJson<SfzSensorBlockJson>(cj) : null;
+                        var d = depthName != null && members.TryGetValue(depthName, out var dj)
+                            ? JsonUtility.FromJson<SfzSensorBlockJson>(dj) : null;
+
                         records.Add(new SfzV2FrameRecord
                         {
-                            FrameIndex      = j.frame,
-                            TimestampNs     = j.ts,
-                            Position        = j.pos  != null && j.pos.Length >= 3
-                                              ? new Vector3(j.pos[0], j.pos[1], j.pos[2])
+                            FrameIndex      = frame++,
+                            TimestampNs     = c?.ts ?? 0,
+                            Position        = c?.pos != null && c.pos.Length >= 3
+                                              ? new Vector3(c.pos[0], c.pos[1], c.pos[2])
                                               : Vector3.zero,
-                            Rotation        = j.rot  != null && j.rot.Length >= 4
-                                              ? new Quaternion(j.rot[0], j.rot[1], j.rot[2], j.rot[3])
+                            Rotation        = c?.rot != null && c.rot.Length >= 4
+                                              ? new Quaternion(c.rot[0], c.rot[1], c.rot[2], c.rot[3])
                                               : Quaternion.identity,
-                            Intrinsics      = new Vector4(j.fx, j.fy, j.cx, j.cy),
-                            DepthByteOffset = j.depth_off,
-                            DepthByteSize   = j.depth_sz,
-                            RgbFrame        = j.rgb_frame,
+                            Intrinsics      = c != null ? new Vector4(c.fx, c.fy, c.cx, c.cy) : Vector4.zero,
+                            DepthByteOffset = d?.off ?? 0,
+                            DepthByteSize   = d != null && d.index >= 0 ? d.sz : 0,
+                            ColorIndex      = c?.index ?? -1,
                         });
                     }
                     Debug.Log($"[SF] {BackendLabel}: parsed {records.Count} frame records from frames.jsonl.");
@@ -895,25 +1034,21 @@ namespace SensorFlex.Player.Library
                 }
             }
 
-            // Playback is driven by rgb.mp4 frame indices, and poses/intrinsics/depth are looked
-            // up by that index. When records carry rgb_frame, reorder them so record i is the one
-            // shown with video frame i, dropping records whose color frame was not encoded.
-            // Archives without rgb_frame keep the 1:1 assumption.
+            // Playback is driven by color video frame indices, and poses/intrinsics/depth are looked
+            // up by that index. Reorder frames so entry i is the one shown with video frame i,
+            // dropping frames whose image is missing (color index -1).
             static SfzV2FrameRecord[] AlignToVideoFrames(List<SfzV2FrameRecord> records)
             {
-                if (records.Count == 0 || records.Exists(r => r.RgbFrame == RgbFrameAbsent))
-                    return records.ToArray();
-
-                var aligned = records.FindAll(r => r.RgbFrame >= 0);
-                aligned.Sort((a, b) => a.RgbFrame.CompareTo(b.RgbFrame));
+                var aligned = records.FindAll(r => r.ColorIndex >= 0);
+                aligned.Sort((a, b) => a.ColorIndex.CompareTo(b.ColorIndex));
 
                 int dropped = records.Count - aligned.Count;
                 if (dropped > 0)
-                    Debug.Log($"[SF] SFZ: {dropped} frame records have no color frame; aligned {aligned.Count} records to rgb.mp4.");
+                    Debug.Log($"[SF] SFZ: {dropped} frames have no color image; aligned {aligned.Count} frames to the color video.");
                 for (int i = 0; i < aligned.Count; i++)
-                    if (aligned[i].RgbFrame != i)
+                    if (aligned[i].ColorIndex != i)
                     {
-                        Debug.LogWarning($"[SF] SFZ: rgb_frame indices are not contiguous (record for video frame {i} has rgb_frame={aligned[i].RgbFrame}).");
+                        Debug.LogWarning($"[SF] SFZ: color indices are not contiguous (frame for video frame {i} has index={aligned[i].ColorIndex}).");
                         break;
                     }
                 return aligned.ToArray();
