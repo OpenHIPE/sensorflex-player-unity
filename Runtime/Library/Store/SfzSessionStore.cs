@@ -268,21 +268,42 @@ namespace SensorFlex.Player.Library
                 ["frames"] = new SfzTrackInfo("frames", sampleInterval, raw.frame_count)
             };
 
+            // Dispatch on depth encoding to determine which file to use.
+            string depthEncoding = raw.depth?.encoding ?? "lz4_float32";
+            string depthBinFile  = null;
+            string depthMp4File  = null;
+            switch (depthEncoding)
+            {
+                case "hevc_float16":
+                case "hevc_uint8_norm":
+                case "h264_uint8_norm":
+                    depthMp4File = raw.depth?.file ?? "depth.mp4";
+                    break;
+                default: // "lz4_float32" and unknown
+                    depthBinFile = raw.depth?.file ?? "depth.bin";
+                    break;
+            }
+
+            float depthMaxMeters = raw.depth != null && raw.depth.depth_max_meters > 0f
+                ? raw.depth.depth_max_meters : 10f;
+
             data = new SfzSessionData(
                 raw.session_id,
                 tracks,
                 new Dictionary<string, SfzAttachmentInfo>(),
-                frameRecords:    null,
-                isVideoFormat:   false,
-                isV2Format:      true,
-                rgbMp4File:      raw.rgb?.file  ?? "rgb.mp4",
-                depthMp4File:    null,
-                depthBinFile:    raw.depth?.file ?? "depth.bin",
-                rgbWidth:        raw.rgb?.width   ?? 1920,
-                rgbHeight:       raw.rgb?.height  ?? 1440,
-                depthWidth:      raw.depth?.width  ?? 256,
-                depthHeight:     raw.depth?.height ?? 192,
-                frameCount:      raw.frame_count);
+                frameRecords:   null,
+                isVideoFormat:  false,
+                isV2Format:     true,
+                rgbMp4File:     raw.rgb?.file   ?? "rgb.mp4",
+                depthMp4File:   depthMp4File,
+                depthBinFile:   depthBinFile,
+                depthEncoding:  depthEncoding,
+                depthMaxMeters: depthMaxMeters,
+                rgbWidth:       raw.rgb?.width    ?? 1920,
+                rgbHeight:      raw.rgb?.height   ?? 1440,
+                depthWidth:     raw.depth?.width  ?? 256,
+                depthHeight:    raw.depth?.height ?? 192,
+                frameCount:     raw.frame_count);
 
             return true;
         }
@@ -656,17 +677,32 @@ namespace SensorFlex.Player.Library
             long          m_CurrentFrame = -1;
             Action<int>   m_FrameReadyCallback;
 
-            // ── Depth ─────────────────────────────────────────────────────────
+            // ── Bin Depth (LZ4 or Zstd) ───────────────────────────────────────
             SfzV2FrameRecord[] m_V2Records;
             FileStream         m_DepthStream;
             Texture2D          m_DepthTexture;
             int                m_DepthW, m_DepthH;
             byte[]             m_CompressedBuf;
             byte[]             m_DecompressedBuf;
+            string             m_DepthEncoding;  // "lz4_float32" or "zstd_float32"
+
+#if UNITY_IOS && !UNITY_EDITOR
+            [System.Runtime.InteropServices.DllImport("__Internal")]
+            static extern UIntPtr SFDecodeBlock(IntPtr src, UIntPtr srcLen,
+                                                IntPtr dst, UIntPtr dstLen, int algo);
+#endif
+
+            // ── Video Depth (optional) ─────────────────────────────────────────
+            bool          m_UseDepthVideo;
+            RenderTexture m_DepthRT;
+            GameObject    m_DepthGo;
+            VideoPlayer   m_DepthVideoPlayer;
+            bool          m_DepthPrepared;
+            string        m_TempDepthVideoPath;
 
             public RenderTexture VideoRgbTexture   => m_RgbRT;
-            public RenderTexture VideoDepthTexture => null;
-            public Texture2D     V2DepthTexture    => m_DepthTexture;
+            public RenderTexture VideoDepthTexture => m_UseDepthVideo ? m_DepthRT : null;
+            public Texture2D     V2DepthTexture    => m_UseDepthVideo ? null : m_DepthTexture;
 
             public void AllocateRingBuffer()
             {
@@ -687,25 +723,55 @@ namespace SensorFlex.Player.Library
             public void InitializePlayers(
                 string rgbPath, string depthBinPath,
                 SfzV2FrameRecord[] v2Records,
-                int rgbW, int rgbH, int depthW, int depthH)
+                int rgbW, int rgbH, int depthW, int depthH,
+                string depthVideoPath = null,
+                string depthEncoding  = "lz4_float32")
             {
                 m_TempRgbPath      = rgbPath;
                 m_TempDepthBinPath = depthBinPath;
                 m_V2Records        = v2Records;
                 m_DepthW           = depthW;
                 m_DepthH           = depthH;
+                m_UseDepthVideo    = !string.IsNullOrEmpty(depthVideoPath);
+                m_DepthEncoding    = depthEncoding ?? "lz4_float32";
 
                 m_RgbRT = new RenderTexture(rgbW, rgbH, 0, RenderTextureFormat.ARGB32) { name = "SF-V2-RgbVideo" };
                 m_RgbRT.Create();
 
-                m_DepthTexture = new Texture2D(depthW, depthH, TextureFormat.RFloat, false) { name = "SF-V2-Depth" };
+                if (m_UseDepthVideo)
+                {
+                    // Video depth mode — create a VideoPlayer for depth.mp4.
+                    m_TempDepthVideoPath = depthVideoPath;
+                    m_DepthRT = new RenderTexture(depthW, depthH, 0, RenderTextureFormat.ARGB32) { name = "SF-V2-DepthVideo" };
+                    m_DepthRT.Create();
 
-                if (File.Exists(depthBinPath))
-                    m_DepthStream = File.OpenRead(depthBinPath);
+                    m_DepthGo = new GameObject("SF-VideoPlayer-V2-Depth") { hideFlags = HideFlags.HideAndDontSave };
+                    UnityEngine.Object.DontDestroyOnLoad(m_DepthGo);
+
+                    m_DepthVideoPlayer = m_DepthGo.AddComponent<VideoPlayer>();
+                    m_DepthVideoPlayer.source          = VideoSource.Url;
+                    m_DepthVideoPlayer.url             = "file://" + depthVideoPath;
+                    m_DepthVideoPlayer.renderMode      = VideoRenderMode.RenderTexture;
+                    m_DepthVideoPlayer.targetTexture   = m_DepthRT;
+                    m_DepthVideoPlayer.playOnAwake     = false;
+                    m_DepthVideoPlayer.isLooping       = false;
+                    m_DepthVideoPlayer.audioOutputMode = VideoAudioOutputMode.None;
+                    m_DepthVideoPlayer.skipOnDrop      = false;
+                    m_DepthVideoPlayer.prepareCompleted += OnDepthVideoPrepared;
+                    m_DepthVideoPlayer.Prepare();
+                }
                 else
-                    Debug.LogWarning($"[SF] V2: depth.bin not found at {depthBinPath}");
+                {
+                    // LZ4 depth mode — open FileStream on depth.bin.
+                    m_DepthTexture = new Texture2D(depthW, depthH, TextureFormat.RFloat, false) { name = "SF-V2-Depth" };
 
-                m_DecompressedBuf = new byte[depthW * depthH * 4];
+                    if (!string.IsNullOrEmpty(depthBinPath) && File.Exists(depthBinPath))
+                        m_DepthStream = File.OpenRead(depthBinPath);
+                    else if (!string.IsNullOrEmpty(depthBinPath))
+                        Debug.LogWarning($"[SF] V2: depth.bin not found at {depthBinPath}");
+
+                    m_DecompressedBuf = new byte[depthW * depthH * 4];
+                }
 
                 m_RgbGo = new GameObject("SF-VideoPlayer-V2-RGB") { hideFlags = HideFlags.HideAndDontSave };
                 UnityEngine.Object.DontDestroyOnLoad(m_RgbGo);
@@ -734,13 +800,31 @@ namespace SensorFlex.Player.Library
             void OnRgbPrepared(VideoPlayer _)
             {
                 m_RgbPrepared = true;
+                CheckAllPrepared();
+            }
+
+            void OnDepthVideoPrepared(VideoPlayer _)
+            {
+                m_DepthPrepared = true;
+                CheckAllPrepared();
+            }
+
+            void CheckAllPrepared()
+            {
+                if (!m_RgbPrepared) return;
+                if (m_UseDepthVideo && !m_DepthPrepared) return;
                 if (m_RgbPlayer.isPlaying) m_RgbPlayer.Pause();
+                if (m_UseDepthVideo && m_DepthVideoPlayer != null && m_DepthVideoPlayer.isPlaying)
+                    m_DepthVideoPlayer.Pause();
                 IsReady = true;
-                Debug.Log("[SF] VideoV2BackendState: RGB VideoPlayer prepared.");
+                Debug.Log("[SF] VideoV2BackendState: prepared. depthVideo=" + m_UseDepthVideo);
             }
 
             public void UpdateDepthForFrame(int frameIdx)
             {
+                // No-op when depth is a VideoPlayer — it advances automatically.
+                if (m_UseDepthVideo) return;
+
                 if (m_DepthStream == null || m_V2Records == null ||
                     frameIdx < 0 || frameIdx >= m_V2Records.Length) return;
 
@@ -760,8 +844,11 @@ namespace SensorFlex.Player.Library
                         if (n <= 0) break;
                         totalRead += n;
                     }
-                    Lz4BlockDecoder.Decode(m_CompressedBuf, 0, rec.DepthByteSize,
-                                           m_DecompressedBuf, 0, m_DecompressedBuf.Length);
+                    if (m_DepthEncoding == "zstd_float32")
+                        DecodeZstdBlock(m_CompressedBuf, rec.DepthByteSize, m_DecompressedBuf);
+                    else
+                        Lz4BlockDecoder.Decode(m_CompressedBuf, 0, rec.DepthByteSize,
+                                               m_DecompressedBuf, 0, m_DecompressedBuf.Length);
                     m_DepthTexture.LoadRawTextureData(m_DecompressedBuf);
                     m_DepthTexture.Apply(false);
                 }
@@ -771,16 +858,48 @@ namespace SensorFlex.Player.Library
                 }
             }
 
+            static void DecodeZstdBlock(byte[] src, int srcLen, byte[] dst)
+            {
+#if UNITY_IOS && !UNITY_EDITOR
+                // GCHandle pins the arrays so the GC won't move them during the P/Invoke call.
+                var hSrc = System.Runtime.InteropServices.GCHandle.Alloc(src, System.Runtime.InteropServices.GCHandleType.Pinned);
+                var hDst = System.Runtime.InteropServices.GCHandle.Alloc(dst, System.Runtime.InteropServices.GCHandleType.Pinned);
+                try
+                {
+                    SFDecodeBlock(hSrc.AddrOfPinnedObject(), (UIntPtr)srcLen,
+                                  hDst.AddrOfPinnedObject(), (UIntPtr)dst.Length, 1);
+                }
+                finally { hSrc.Free(); hDst.Free(); }
+#else
+                Debug.LogWarning("[SF] Zstd depth decode not supported on this platform.");
+#endif
+            }
+
             public void SetFrameReadyCallback(Action<int> cb) { m_FrameReadyCallback = cb; }
 
-            public void PlayVideo()  { m_RgbPlayer?.Play(); }
-            public void PauseVideo() { if (m_RgbPlayer?.isPlaying == true) m_RgbPlayer.Pause(); }
+            public void PlayVideo()
+            {
+                m_RgbPlayer?.Play();
+                if (m_UseDepthVideo) m_DepthVideoPlayer?.Play();
+            }
+
+            public void PauseVideo()
+            {
+                if (m_RgbPlayer?.isPlaying == true) m_RgbPlayer.Pause();
+                if (m_UseDepthVideo && m_DepthVideoPlayer?.isPlaying == true) m_DepthVideoPlayer.Pause();
+            }
 
             public void SetVideoPlaybackSpeed(float speed)
-            { if (m_RgbPlayer != null) m_RgbPlayer.playbackSpeed = speed; }
+            {
+                if (m_RgbPlayer != null) m_RgbPlayer.playbackSpeed = speed;
+                if (m_UseDepthVideo && m_DepthVideoPlayer != null) m_DepthVideoPlayer.playbackSpeed = speed;
+            }
 
             public void SetVideoLooping(bool loop)
-            { if (m_RgbPlayer != null) m_RgbPlayer.isLooping = loop; }
+            {
+                if (m_RgbPlayer != null) m_RgbPlayer.isLooping = loop;
+                if (m_UseDepthVideo && m_DepthVideoPlayer != null) m_DepthVideoPlayer.isLooping = loop;
+            }
 
             public long VideoPlayerCurrentFrame => Volatile.Read(ref m_CurrentFrame);
 
@@ -788,6 +907,8 @@ namespace SensorFlex.Player.Library
             {
                 if (m_RgbPlayer != null && m_RgbPlayer.isPrepared)
                     m_RgbPlayer.frame = (long)frameIndex;
+                if (m_UseDepthVideo && m_DepthVideoPlayer != null && m_DepthVideoPlayer.isPrepared)
+                    m_DepthVideoPlayer.frame = (long)frameIndex;
                 Volatile.Write(ref m_CurrentFrame, (long)frameIndex);
             }
 
@@ -802,11 +923,28 @@ namespace SensorFlex.Player.Library
                 }
                 if (m_RgbGo != null) { UnityEngine.Object.Destroy(m_RgbGo); m_RgbGo = null; }
                 if (m_RgbRT != null) { m_RgbRT.Release(); UnityEngine.Object.Destroy(m_RgbRT); m_RgbRT = null; }
-                if (m_DepthTexture != null) { UnityEngine.Object.Destroy(m_DepthTexture); m_DepthTexture = null; }
-                m_DepthStream?.Close();
-                m_DepthStream = null;
+
+                if (m_UseDepthVideo)
+                {
+                    if (m_DepthVideoPlayer != null)
+                    {
+                        m_DepthVideoPlayer.prepareCompleted -= OnDepthVideoPrepared;
+                        m_DepthVideoPlayer.Stop();
+                        m_DepthVideoPlayer = null;
+                    }
+                    if (m_DepthGo != null) { UnityEngine.Object.Destroy(m_DepthGo); m_DepthGo = null; }
+                    if (m_DepthRT != null) { m_DepthRT.Release(); UnityEngine.Object.Destroy(m_DepthRT); m_DepthRT = null; }
+                    TryDeleteTemp(m_TempDepthVideoPath);
+                }
+                else
+                {
+                    if (m_DepthTexture != null) { UnityEngine.Object.Destroy(m_DepthTexture); m_DepthTexture = null; }
+                    m_DepthStream?.Close();
+                    m_DepthStream = null;
+                    TryDeleteTemp(m_TempDepthBinPath);
+                }
+
                 TryDeleteTemp(m_TempRgbPath);
-                TryDeleteTemp(m_TempDepthBinPath);
             }
 
             static void TryDeleteTemp(string path)
@@ -892,45 +1030,51 @@ namespace SensorFlex.Player.Library
             internal SfzFrameRecordJson[] FrameRecords { get; }
             internal bool   IsVideoFormat { get; }
             internal bool   IsV2Format    { get; }
-            internal string RgbMp4File   { get; }
-            internal string DepthMp4File { get; }
-            internal string DepthBinFile { get; }
-            internal int    RgbWidth     { get; }
-            internal int    RgbHeight    { get; }
-            internal int    DepthWidth   { get; }
-            internal int    DepthHeight  { get; }
-            internal int    FrameCount   { get; }
+            internal string RgbMp4File    { get; }
+            internal string DepthMp4File  { get; }
+            internal string DepthBinFile  { get; }
+            internal string DepthEncoding { get; }  // e.g. "lz4_float32", "hevc_float16", "h264_uint8_norm"
+            internal float  DepthMaxMeters { get; } // for uint8_norm codecs
+            internal int    RgbWidth      { get; }
+            internal int    RgbHeight     { get; }
+            internal int    DepthWidth    { get; }
+            internal int    DepthHeight   { get; }
+            internal int    FrameCount    { get; }
 
             internal SfzSessionData(
                 string sessionId,
                 IReadOnlyDictionary<string, SfzTrackInfo>      tracks,
                 IReadOnlyDictionary<string, SfzAttachmentInfo> attachments,
                 SfzFrameRecordJson[]                           frameRecords,
-                bool   isVideoFormat = false,
-                bool   isV2Format    = false,
-                string rgbMp4File    = null,
-                string depthMp4File  = null,
-                string depthBinFile  = null,
-                int    rgbWidth      = 1920,
-                int    rgbHeight     = 1440,
-                int    depthWidth    = 256,
-                int    depthHeight   = 192,
-                int    frameCount    = 0)
+                bool   isVideoFormat   = false,
+                bool   isV2Format      = false,
+                string rgbMp4File      = null,
+                string depthMp4File    = null,
+                string depthBinFile    = null,
+                string depthEncoding   = "lz4_float32",
+                float  depthMaxMeters  = 10f,
+                int    rgbWidth        = 1920,
+                int    rgbHeight       = 1440,
+                int    depthWidth      = 256,
+                int    depthHeight     = 192,
+                int    frameCount      = 0)
             {
-                SessionId    = sessionId   ?? "session";
-                Tracks       = tracks      ?? new Dictionary<string, SfzTrackInfo>();
-                Attachments  = attachments ?? new Dictionary<string, SfzAttachmentInfo>();
-                FrameRecords = frameRecords;
-                IsVideoFormat = isVideoFormat;
-                IsV2Format   = isV2Format;
-                RgbMp4File   = rgbMp4File;
-                DepthMp4File = depthMp4File;
-                DepthBinFile = depthBinFile;
-                RgbWidth     = rgbWidth;
-                RgbHeight    = rgbHeight;
-                DepthWidth   = depthWidth;
-                DepthHeight  = depthHeight;
-                FrameCount   = frameCount;
+                SessionId     = sessionId   ?? "session";
+                Tracks        = tracks      ?? new Dictionary<string, SfzTrackInfo>();
+                Attachments   = attachments ?? new Dictionary<string, SfzAttachmentInfo>();
+                FrameRecords  = frameRecords;
+                IsVideoFormat  = isVideoFormat;
+                IsV2Format    = isV2Format;
+                RgbMp4File    = rgbMp4File;
+                DepthMp4File  = depthMp4File;
+                DepthBinFile  = depthBinFile;
+                DepthEncoding  = depthEncoding ?? "lz4_float32";
+                DepthMaxMeters = depthMaxMeters > 0f ? depthMaxMeters : 10f;
+                RgbWidth      = rgbWidth;
+                RgbHeight     = rgbHeight;
+                DepthWidth    = depthWidth;
+                DepthHeight   = depthHeight;
+                FrameCount    = frameCount;
             }
         }
 
@@ -999,7 +1143,7 @@ namespace SensorFlex.Player.Library
         // ── Nested: SFZ v2.0 DTOs ────────────────────────────────────────────
 
         [Serializable] class SfzV2RgbJson   { public int width; public int height; public string encoding; public string file; }
-        [Serializable] class SfzV2DepthJson { public int width; public int height; public string encoding; public string file; public string units; public string sensor; }
+        [Serializable] class SfzV2DepthJson { public int width; public int height; public string encoding; public string file; public string units; public string sensor; public float depth_max_meters; }
         [Serializable] class SfzV2SessionJson
         {
             public string         sfz_version;
@@ -1021,6 +1165,7 @@ namespace SensorFlex.Player.Library
             public float fx, fy, cx, cy;
             public long  depth_off;
             public int   depth_sz;
+            public int   depth_frame;
         }
 
         // ── Nested: SFZ conversion helpers ───────────────────────────────────
@@ -1448,8 +1593,9 @@ namespace SensorFlex.Player.Library
                 string cacheDir = Path.Combine(Application.temporaryCachePath, "SFVideoCache");
                 Directory.CreateDirectory(cacheDir);
 
-                string rgbPath      = ExtractFileToTemp(data.RgbMp4File,  cacheDir);
-                string depthBinPath = ExtractFileToTemp(data.DepthBinFile, cacheDir);
+                string rgbPath        = ExtractFileToTemp(data.RgbMp4File,   cacheDir);
+                string depthBinPath   = ExtractFileToTemp(data.DepthBinFile,  cacheDir);
+                string depthVideoPath = ExtractFileToTemp(data.DepthMp4File,  cacheDir);
                 if (rgbPath == null) return;
 
                 // Parse frames.jsonl for poses, intrinsics, and depth offsets.
@@ -1467,13 +1613,15 @@ namespace SensorFlex.Player.Library
                 {
                     for (int i = 0; i < v2Records.Length && i < totalFrames; i++)
                     {
-                        vState.Poses[i]     = Matrix4x4.TRS(v2Records[i].Position, v2Records[i].Rotation, Vector3.one);
+                        vState.Poses[i]      = Matrix4x4.TRS(v2Records[i].Position, v2Records[i].Rotation, Vector3.one);
                         vState.Intrinsics[i] = v2Records[i].Intrinsics;
                     }
                 }
 
                 vState.InitializePlayers(rgbPath, depthBinPath ?? string.Empty,
-                    v2Records, data.RgbWidth, data.RgbHeight, data.DepthWidth, data.DepthHeight);
+                    v2Records, data.RgbWidth, data.RgbHeight, data.DepthWidth, data.DepthHeight,
+                    depthVideoPath: depthVideoPath,
+                    depthEncoding:  data.DepthEncoding);
 
                 m_State       = vState;
                 m_SessionData = data;

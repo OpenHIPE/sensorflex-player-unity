@@ -372,11 +372,11 @@ MonoBehaviour:
   m_EditorClassIdentifier: SensorFlex.Player.Runtime::SensorFlex.Player.ARSensorFlexSession
   m_XROrigin: {fileID: 245269512}
   m_FrameSourceMode: 1
-  m_SfzFilePath: /Users/yzigm/Downloads/080e58a4a08a4d1aa5e41f3c994d6ce4-00000-of-00001.sfz
+  m_SfzFilePath: /Users/yzigm/Downloads/bbc43bb952bb4bf282196c4140408ebe.sfz
   m_FileIoPath: 
   m_PreloadFrameCount: 120
   m_LoopSequence: 1
-  m_AutoPlay: 0
+  m_AutoPlay: 1
   m_DepthEnabled: 1
   m_SessionAlignment:
     enabled: 0
