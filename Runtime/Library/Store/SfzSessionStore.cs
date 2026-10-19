@@ -997,7 +997,10 @@ namespace SensorFlex.Player.Library
             public Vector4    Intrinsics;    // (fx, fy, cx, cy)
             public long       DepthByteOffset;
             public int        DepthByteSize;
+            public int        RgbFrame;      // index into rgb.mp4; -1 = no color; RgbFrameAbsent = old archive
         }
+
+        const int RgbFrameAbsent = int.MinValue;
 
         // ── Nested: Session contracts ─────────────────────────────────────────
 
@@ -1200,6 +1203,7 @@ namespace SensorFlex.Player.Library
             public long  depth_off;
             public int   depth_sz;
             public int   depth_frame;
+            public int   rgb_frame = RgbFrameAbsent;   // absent in archives written before rgb_frame existed
         }
 
         // ── Nested: SFZ conversion helpers ───────────────────────────────────
@@ -1634,6 +1638,8 @@ namespace SensorFlex.Player.Library
 
                 // Parse frames.jsonl for poses, intrinsics, and depth offsets.
                 var v2Records = ParseFramesJsonl(cacheDir, totalFrames);
+                if (v2Records != null && v2Records.Length > 0 && v2Records.Length < totalFrames)
+                    totalFrames = v2Records.Length;   // records without a color frame were removed
 
                 var vState = new VideoV2BackendState
                 {
@@ -1715,16 +1721,41 @@ namespace SensorFlex.Player.Library
                             Intrinsics      = new Vector4(j.fx, j.fy, j.cx, j.cy),
                             DepthByteOffset = j.depth_off,
                             DepthByteSize   = j.depth_sz,
+                            RgbFrame        = j.rgb_frame,
                         });
                     }
                     Debug.Log($"[SF] SFZ v2: parsed {records.Count} frame records from frames.jsonl.");
-                    return records.ToArray();
+                    return AlignToVideoFrames(records);
                 }
                 catch (Exception e)
                 {
                     Debug.LogError($"[SF] SFZ v2: failed to parse frames.jsonl: {e}");
                     return null;
                 }
+            }
+
+            // Playback is driven by rgb.mp4 frame indices, and poses/intrinsics/depth are looked
+            // up by that index. When records carry rgb_frame, reorder them so record i is the one
+            // shown with video frame i, dropping records whose color frame was not encoded.
+            // Archives without rgb_frame keep the old 1:1 assumption.
+            static SfzV2FrameRecord[] AlignToVideoFrames(List<SfzV2FrameRecord> records)
+            {
+                if (records.Count == 0 || records.Exists(r => r.RgbFrame == RgbFrameAbsent))
+                    return records.ToArray();
+
+                var aligned = records.FindAll(r => r.RgbFrame >= 0);
+                aligned.Sort((a, b) => a.RgbFrame.CompareTo(b.RgbFrame));
+
+                int dropped = records.Count - aligned.Count;
+                if (dropped > 0)
+                    Debug.Log($"[SF] SFZ v2: {dropped} frame records have no color frame; aligned {aligned.Count} records to rgb.mp4.");
+                for (int i = 0; i < aligned.Count; i++)
+                    if (aligned[i].RgbFrame != i)
+                    {
+                        Debug.LogWarning($"[SF] SFZ v2: rgb_frame indices are not contiguous (record for video frame {i} has rgb_frame={aligned[i].RgbFrame}).");
+                        break;
+                    }
+                return aligned.ToArray();
             }
 
             string ExtractFileToTemp(string archiveFileName, string cacheDir)
