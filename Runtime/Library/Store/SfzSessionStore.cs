@@ -279,10 +279,18 @@ namespace SensorFlex.Player.Library
                 case "h264_uint8_norm":
                     depthMp4File = raw.depth?.file ?? "depth.mp4";
                     break;
-                default: // "lz4_float32" and unknown
+                default: // "lz4_float32", "lz4_uint16", "zstd_float32" and unknown
                     depthBinFile = raw.depth?.file ?? "depth.bin";
                     break;
             }
+
+            // Factor that converts a decoded depth value to metres.
+            float depthUnitScale = raw.depth?.units switch
+            {
+                "millimeters" => 0.001f,
+                "centimeters" => 0.01f,
+                _             => 1f,
+            };
 
             float depthMaxMeters = raw.depth != null && raw.depth.depth_max_meters > 0f
                 ? raw.depth.depth_max_meters : 10f;
@@ -299,6 +307,7 @@ namespace SensorFlex.Player.Library
                 depthBinFile:   depthBinFile,
                 depthEncoding:  depthEncoding,
                 depthMaxMeters: depthMaxMeters,
+                depthUnitScale: depthUnitScale,
                 rgbWidth:       raw.rgb?.width    ?? 1920,
                 rgbHeight:      raw.rgb?.height   ?? 1440,
                 depthWidth:     raw.depth?.width  ?? 256,
@@ -684,7 +693,9 @@ namespace SensorFlex.Player.Library
             int                m_DepthW, m_DepthH;
             byte[]             m_CompressedBuf;
             byte[]             m_DecompressedBuf;
-            string             m_DepthEncoding;  // "lz4_float32" or "zstd_float32"
+            string             m_DepthEncoding;  // "lz4_float32", "lz4_uint16" or "zstd_float32"
+            float              m_DepthUnitScale = 1f;
+            byte[]             m_U16Buf;         // lz4_uint16: decoded uint16 before conversion to float metres
 
 #if UNITY_IOS && !UNITY_EDITOR
             [System.Runtime.InteropServices.DllImport("__Internal")]
@@ -725,7 +736,8 @@ namespace SensorFlex.Player.Library
                 SfzV2FrameRecord[] v2Records,
                 int rgbW, int rgbH, int depthW, int depthH,
                 string depthVideoPath = null,
-                string depthEncoding  = "lz4_float32")
+                string depthEncoding  = "lz4_float32",
+                float  depthUnitScale = 1f)
             {
                 m_TempRgbPath      = rgbPath;
                 m_TempDepthBinPath = depthBinPath;
@@ -734,6 +746,7 @@ namespace SensorFlex.Player.Library
                 m_DepthH           = depthH;
                 m_UseDepthVideo    = !string.IsNullOrEmpty(depthVideoPath);
                 m_DepthEncoding    = depthEncoding ?? "lz4_float32";
+                m_DepthUnitScale   = depthUnitScale > 0f ? depthUnitScale : 1f;
 
                 m_RgbRT = new RenderTexture(rgbW, rgbH, 0, RenderTextureFormat.ARGB32) { name = "SF-V2-RgbVideo" };
                 m_RgbRT.Create();
@@ -771,6 +784,8 @@ namespace SensorFlex.Player.Library
                         Debug.LogWarning($"[SF] V2: depth.bin not found at {depthBinPath}");
 
                     m_DecompressedBuf = new byte[depthW * depthH * 4];
+                    if (m_DepthEncoding == "lz4_uint16")
+                        m_U16Buf = new byte[depthW * depthH * 2];
                 }
 
                 m_RgbGo = new GameObject("SF-VideoPlayer-V2-RGB") { hideFlags = HideFlags.HideAndDontSave };
@@ -846,6 +861,12 @@ namespace SensorFlex.Player.Library
                     }
                     if (m_DepthEncoding == "zstd_float32")
                         DecodeZstdBlock(m_CompressedBuf, rec.DepthByteSize, m_DecompressedBuf);
+                    else if (m_DepthEncoding == "lz4_uint16")
+                    {
+                        Lz4BlockDecoder.Decode(m_CompressedBuf, 0, rec.DepthByteSize,
+                                               m_U16Buf, 0, m_U16Buf.Length);
+                        U16ToFloatMeters(m_U16Buf, m_DecompressedBuf, m_DepthUnitScale);
+                    }
                     else
                         Lz4BlockDecoder.Decode(m_CompressedBuf, 0, rec.DepthByteSize,
                                                m_DecompressedBuf, 0, m_DecompressedBuf.Length);
@@ -856,6 +877,16 @@ namespace SensorFlex.Player.Library
                 {
                     Debug.LogWarning($"[SF] V2 depth decode failed frame={frameIdx}: {e.Message}");
                 }
+            }
+
+            // Little-endian uint16 → float32 (value × scale) for the RFloat depth texture.
+            static void U16ToFloatMeters(byte[] src, byte[] dst, float scale)
+            {
+                var s16 = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ushort>(src);
+                var f32 = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(dst);
+                int n = Math.Min(s16.Length, f32.Length);
+                for (int i = 0; i < n; i++)
+                    f32[i] = s16[i] * scale;
             }
 
             static void DecodeZstdBlock(byte[] src, int srcLen, byte[] dst)
@@ -1035,6 +1066,7 @@ namespace SensorFlex.Player.Library
             internal string DepthBinFile  { get; }
             internal string DepthEncoding { get; }  // e.g. "lz4_float32", "hevc_float16", "h264_uint8_norm"
             internal float  DepthMaxMeters { get; } // for uint8_norm codecs
+            internal float  DepthUnitScale { get; } // decoded value × scale = metres (lz4_uint16 mm → 0.001)
             internal int    RgbWidth      { get; }
             internal int    RgbHeight     { get; }
             internal int    DepthWidth    { get; }
@@ -1053,6 +1085,7 @@ namespace SensorFlex.Player.Library
                 string depthBinFile    = null,
                 string depthEncoding   = "lz4_float32",
                 float  depthMaxMeters  = 10f,
+                float  depthUnitScale  = 1f,
                 int    rgbWidth        = 1920,
                 int    rgbHeight       = 1440,
                 int    depthWidth      = 256,
@@ -1070,6 +1103,7 @@ namespace SensorFlex.Player.Library
                 DepthBinFile  = depthBinFile;
                 DepthEncoding  = depthEncoding ?? "lz4_float32";
                 DepthMaxMeters = depthMaxMeters > 0f ? depthMaxMeters : 10f;
+                DepthUnitScale = depthUnitScale > 0f ? depthUnitScale : 1f;
                 RgbWidth      = rgbWidth;
                 RgbHeight     = rgbHeight;
                 DepthWidth    = depthWidth;
@@ -1621,7 +1655,8 @@ namespace SensorFlex.Player.Library
                 vState.InitializePlayers(rgbPath, depthBinPath ?? string.Empty,
                     v2Records, data.RgbWidth, data.RgbHeight, data.DepthWidth, data.DepthHeight,
                     depthVideoPath: depthVideoPath,
-                    depthEncoding:  data.DepthEncoding);
+                    depthEncoding:  data.DepthEncoding,
+                    depthUnitScale: data.DepthUnitScale);
 
                 m_State       = vState;
                 m_SessionData = data;
